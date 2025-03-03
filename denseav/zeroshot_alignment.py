@@ -25,6 +25,9 @@ def decode_mask(rle):
     return maskUtils.decode(rle)
 
 
+def time_to_frame(t, sampling_rate=16000):
+    return t * sampling_rate
+
 class AlignmentDataset(Dataset):
     def __init__(self, dataset_csv, img_dir, audio_dir, annotations_dir):
         self.img_dir = img_dir
@@ -50,9 +53,7 @@ class AlignmentDataset(Dataset):
             wav = torchaudio.transforms.Resample(orig_freq=audio_sample_rate,
                                                  new_freq=16000)(wav)
 
-        annotation_path = os.path.join(self.annotations, self.annotations[idx])
-        with open(annotation_path, "r") as annotations:
-            gt = json.load(annotations)
+        gt = self.annotations[idx]
 
         return img, wav, gt
 
@@ -74,8 +75,10 @@ def eval_model(model, dataloader, device="cpu"):
                  agg_heads=True
             ).mean(dim=-2)
             
-            for obj in gt:
-                label, mask, start, end = obj["class"], obj["mask"], obj["start"], obj["end"]
+            for label in gt:
+                obj = gt[label]
+                mask = obj["mask"]
+                start, end = time_to_frame(obj["start"]), time_to_frame(obj["end"])
                 mask = decode_mask(mask)
 
                 AS_obj = get_alignment_score_object(sims, start, end, mask)
@@ -104,7 +107,7 @@ if __name__ == "__main__":
     model.to(device)
 
     alignment_data = AlignmentDataset("~/scratch/flickr8k.csv",
-                                  img_dir="~/scratch/img",
+                                  img_dir="home/brdiep/scratch/img",
                                   audio_dir="~/scratch/wav",
                                   annotations_dir="~/scratch/anns")
     eval_dataloader  = DataLoader(alignment_data, batch_size=1)
