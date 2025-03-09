@@ -5,8 +5,8 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning import seed_everything
 from pytorch_lightning.loggers import TensorBoardLogger
-from denseav.data.EvaluationDatasets import FlickrAudio
 from denseav.shared import load_trained_model
+from denseav.plotting import _prep_sims_for_plotting
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import os
@@ -18,6 +18,7 @@ from spatioalignment_utils import get_alignment_score_object, \
     get_glancing_score_object, get_alignment_score_word, \
         get_glancing_score_word
 from collections import defaultdict
+import wandb
 
 def decode_mask(rle):
     if isinstance(rle["count"], str):
@@ -26,7 +27,9 @@ def decode_mask(rle):
 
 
 def time_to_frame(t, sampling_rate=16000):
-    return t * sampling_rate
+    return round(t * sampling_rate)
+
+FPS = 8
 
 class AlignmentDataset(Dataset):
     def __init__(self, dataset_csv, img_dir, audio_dir, annotations_dir):
@@ -47,7 +50,7 @@ class AlignmentDataset(Dataset):
         
         audio_path = os.path.join(self.audio_dir, self.wav_files[idx])
         wav, audio_sample_rate = torchaudio.load(audio_path)
-
+        duration = wav.shape[1] / audio_sample_rate
         # Resample to 16000Hz if not already
         if audio_sample_rate != 16000:
             wav = torchaudio.transforms.Resample(orig_freq=audio_sample_rate,
@@ -55,7 +58,10 @@ class AlignmentDataset(Dataset):
 
         gt = self.annotations[idx]
 
-        return img, wav, gt
+        n_frames = int(duration * FPS)
+        img.unsqueeze(0).repeat(n_frames, 1, 1, 1)
+
+        return img.to(torch.float32), wav.to(torch.float32), gt
 
 
 def eval_model(model, dataloader, device="cpu"):
@@ -64,9 +70,11 @@ def eval_model(model, dataloader, device="cpu"):
 
     with torch.no_grad():
         for idx, sample in enumerate(dataloader):
-            audio, img, gt = sample
-            audio_feats = model.forward_audio({"audio": audio})
-            img_feats = model.forward_image({"image": img})
+            img, audio, gt = sample
+            audio = audio.squeeze(1)
+            
+            audio_feats = model.forward_audio({"audio": audio.to(device)})
+            img_feats = model.forward_image({"frames": img.to(device)})
 
             sims = model.sim_agg.get_pairwise_sims(
                 {**img_feats, **audio_feats},
@@ -74,11 +82,13 @@ def eval_model(model, dataloader, device="cpu"):
                  agg_sim=False,
                  agg_heads=True
             ).mean(dim=-2)
+
+            sims = _prep_sims_for_plotting(sims, frames=img.shape[0])
             
             for label in gt:
                 obj = gt[label]
                 mask = obj["mask"]
-                start, end = time_to_frame(obj["start"]), time_to_frame(obj["end"])
+                start, end = time_to_frame(obj["start"], sampling_rate=FPS), time_to_frame(obj["end"], sampling_rate=FPS)
                 mask = decode_mask(mask)
 
                 AS_obj = get_alignment_score_object(sims, start, end, mask)
@@ -106,9 +116,14 @@ if __name__ == "__main__":
     model = torch.hub.load('mhamilton723/DenseAV', model_name)
     model.to(device)
 
-    alignment_data = AlignmentDataset("~/scratch/flickr8k.csv",
-                                  img_dir="home/brdiep/scratch/img",
-                                  audio_dir="~/scratch/wav",
+    wandb.init(project="eval_denseav", settings=wandb.Settings(start_method="fork"))
+
+    alignment_data = AlignmentDataset("/home/brdiep/scratch/flickr_eval_triplets/flickr_eval_triplets.csv",
+                                  img_dir="/home/brdiep/scratch/flickr_eval_triplets/imgs",
+                                  audio_dir="/home/brdiep/scratch/flickr_eval_triplets/wavs",
                                   annotations_dir="~/scratch/anns")
     eval_dataloader  = DataLoader(alignment_data, batch_size=1)
     df = eval_model(model, eval_dataloader, device)
+
+    score_table = wandb.Table(dataframe=df)
+    wandb.log({"Output": score_table})
